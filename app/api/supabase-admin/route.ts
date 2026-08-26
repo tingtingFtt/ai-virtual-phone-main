@@ -16,6 +16,8 @@ type AdminPayload = {
   organizationSlug?: string;
   regionCode?: string;
   sql?: string;
+  /** check_project：用 service_role key 直接探测已有项目（无需 Access Token） */
+  serviceRoleKey?: string;
 };
 
 function cleanToken(value: unknown): string {
@@ -176,6 +178,85 @@ async function handleApiKeys(token: string, projectRef: string): Promise<NextRes
   return NextResponse.json({ ok: true, serviceRoleKey });
 }
 
+/**
+ * check_project：用 service_role key 直接探测已有项目的健康状态与版本。
+ * 不需要 Access Token，适合"其他端连接已部署项目"的场景。
+ * 返回：
+ *   schemaVersion   — ai_phone_cloud_meta 中记录的版本（0=表不存在）
+ *   pushFunctionOk  — ai-phone-push Edge Function 是否可访问
+ *   weixinFunctionOk — weixin-assistant Edge Function 是否可访问
+ *   isPersonalCloud — 是否通过专用项目检测（ai_phone_cloud_meta 存在）
+ */
+async function handleCheckProject(supabaseUrl: string, serviceRoleKey: string): Promise<NextResponse> {
+  const restBase = supabaseUrl.replace(/\/$/, "");
+  const headers = {
+    apikey: serviceRoleKey,
+    Authorization: `Bearer ${serviceRoleKey}`,
+    "Content-Type": "application/json",
+  };
+
+  // 1. 查询 schema_version
+  let schemaVersion = 0;
+  let isPersonalCloud = false;
+  try {
+    const metaRes = await fetch(
+      `${restBase}/rest/v1/ai_phone_cloud_meta?id=eq.personal-cloud&select=schema_version&limit=1`,
+      { headers, cache: "no-store" },
+    );
+    if (metaRes.ok) {
+      const rows = await metaRes.json() as Array<{ schema_version?: number }>;
+      if (rows[0]) {
+        schemaVersion = Number(rows[0].schema_version) || 1;
+        isPersonalCloud = true;
+      }
+    }
+  } catch { /* 网络异常 */ }
+
+  // 2. 探测 ai-phone-push 云函数（OPTIONS 不需要鉴权）
+  let pushFunctionOk = false;
+  try {
+    const pushRes = await fetch(
+      `${restBase}/functions/v1/ai-phone-push?action=health`,
+      {
+        headers: { "x-ai-phone-service-key": serviceRoleKey },
+        cache: "no-store",
+        signal: AbortSignal.timeout(8000),
+      },
+    );
+    if (pushRes.ok) {
+      const data = await pushRes.json() as { ok?: boolean; schemaVersion?: number };
+      pushFunctionOk = data?.ok === true;
+      if (pushFunctionOk && data.schemaVersion) {
+        // 以函数实际报告的 schemaVersion 为准（比 meta 表更新鲜）
+        schemaVersion = Math.max(schemaVersion, Number(data.schemaVersion) || 0);
+      }
+    }
+  } catch { /* 函数不存在或超时 */ }
+
+  // 3. 探测 weixin-assistant 云函数（HEAD 即可）
+  let weixinFunctionOk = false;
+  try {
+    const weixinRes = await fetch(
+      `${restBase}/functions/v1/weixin-assistant`,
+      {
+        method: "OPTIONS",
+        cache: "no-store",
+        signal: AbortSignal.timeout(6000),
+      },
+    );
+    // OPTIONS 返回 2xx 或 4xx 均视为函数存在；5xx / 网络错误视为不存在
+    weixinFunctionOk = weixinRes.status < 500;
+  } catch { /* 函数不存在或超时 */ }
+
+  return NextResponse.json({
+    ok: true,
+    schemaVersion,
+    isPersonalCloud,
+    pushFunctionOk,
+    weixinFunctionOk,
+  });
+}
+
 async function handleRunSql(token: string, projectRef: string, sql: string): Promise<NextResponse> {
   const response = await managementFetch(token, `/projects/${projectRef}/database/query`, {
     method: "POST",
@@ -209,6 +290,13 @@ export async function POST(request: Request): Promise<NextResponse> {
     const projectRef = cleanProjectRef(payload.projectRef);
     if (!projectRef) return NextResponse.json({ ok: false, error: "项目标识不合法。" }, { status: 400 });
 
+    if (payload.action === "check_project") {
+      // 用 service_role key 直接探测，无需 Access Token
+      const serviceRoleKey = cleanToken(payload.serviceRoleKey);
+      const supabaseUrl = `https://${projectRef}.supabase.co`;
+      if (!serviceRoleKey) return NextResponse.json({ ok: false, error: "缺少 service_role key。" }, { status: 400 });
+      return await handleCheckProject(supabaseUrl, serviceRoleKey);
+    }
     if (payload.action === "project_status") return await handleProjectStatus(token, projectRef);
     if (payload.action === "assert_dedicated_project") return await handleAssertDedicatedProject(token, projectRef);
     if (payload.action === "api_keys") return await handleApiKeys(token, projectRef);

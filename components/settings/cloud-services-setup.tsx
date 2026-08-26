@@ -1,14 +1,11 @@
 "use client";
 
 // 云服务统一部署（三合一）：备份桶 / 微信接入 / 离线推送在此一站配置。
-// 交互：中央黑色按钮直达 Supabase 令牌页 → 粘贴 Access Token 点确认 →
-// 弹窗选择 Supabase 组织与部署范围 → 自动创建专用项目并完成：
-// 取回项目地址与 service_role key（写入原云备份配置存储）、
-// 建桶、部署微信/推送云函数并自动执行定时任务 SQL。
-// Token 与取回的 key 经站点代理透传，不存储不记录。
+// 新增「手动连接已有项目」入口，支持其他端直接填写 URL + Key 接入已部署的项目，
+// 并自动检测版本差异，决定是否需要重新部署。
 
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
-import { Check, CloudUpload, ExternalLink, Loader2, MessageSquare, Satellite } from "lucide-react";
+import { Check, ChevronDown, ChevronUp, CloudUpload, ExternalLink, Loader2, MessageSquare, RefreshCw, Satellite, Link } from "lucide-react";
 import {
     isCloudBackupConfigured,
     loadCloudBackupConfig,
@@ -22,7 +19,12 @@ import {
     ensureWeixinCloudCronSecret,
     syncAllWeixinBotRuntimesToCloud,
 } from "@/lib/weixin-cloud-sync";
-import { deployPersonalPushCloud, isPersonalPushCloudActive } from "@/lib/personal-push-cloud";
+import {
+    connectExistingPushCloud,
+    deployPersonalPushCloud,
+    isPersonalPushCloudActive,
+    PERSONAL_PUSH_SCHEMA_VERSION,
+} from "@/lib/personal-push-cloud";
 import { ensurePersonalPushSubscription, getOfflinePushState, markAccountPushSubscribed } from "@/lib/push-client";
 import { getWeixinCloudDeployedAt, markWeixinCloudDeployed, savePushCloudScheduled, saveWeixinCloudScheduled } from "@/lib/cloud-deploy-status";
 import { Input, Select } from "@/components/ui/form";
@@ -41,6 +43,16 @@ export function CloudServicesPage() {
 }
 
 type OrganizationOption = { id: string; slug: string; name: string };
+
+/** 版本检测结果 */
+type CheckResult = {
+    schemaVersion: number;
+    isPersonalCloud: boolean;
+    pushFunctionOk: boolean;
+    weixinFunctionOk: boolean;
+    needsRedeploy: boolean;
+    redeployReason?: string;
+};
 
 function smartRegionForCurrentTimeZone(): "americas" | "emea" | "apac" {
     const zone = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
@@ -75,9 +87,12 @@ async function callSupabaseAdmin<T>(payload: Record<string, unknown>): Promise<T
 }
 
 export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () => void }) {
+    // ── 状态显示 ──────────────────────────────────────────
     const [cloudReady, setCloudReady] = useState(false);
     const [pushActive, setPushActive] = useState(false);
     const [weixinDeployed, setWeixinDeployed] = useState(false);
+
+    // ── 一键部署流程 ──────────────────────────────────────
     const [token, setToken] = useState("");
     const [organizations, setOrganizations] = useState<OrganizationOption[]>([]);
     const [selectedOrganizationSlug, setSelectedOrganizationSlug] = useState("");
@@ -86,14 +101,26 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
     const [scopeWeixin, setScopeWeixin] = useState(true);
     const [scopePush, setScopePush] = useState(true);
     const [dialogOpen, setDialogOpen] = useState(false);
-    const [busy, setBusy] = useState<"organizations" | "deploy" | null>(null);
-    const [resultDialog, setResultDialog] = useState<{ title: string; text: string } | null>(null);
+    const [busy, setBusy] = useState<"organizations" | "deploy" | "connect" | "check" | null>(null);
+    const [resultDialog, setResultDialog] = useState<{ title: string; text: string; warn?: boolean } | null>(null);
     const [progress, setProgress] = useState("");
+
+    // ── 手动连接已有项目 ──────────────────────────────────
+    const [manualPanelOpen, setManualPanelOpen] = useState(false);
+    const [manualUrl, setManualUrl] = useState("");
+    const [manualKey, setManualKey] = useState("");
+    const [checkResult, setCheckResult] = useState<CheckResult | null>(null);
+    // 检测后若需重新部署，展示 Access Token 输入框
+    const [redeployToken, setRedeployToken] = useState("");
+    const [redeployDialogOpen, setRedeployDialogOpen] = useState(false);
 
     useEffect(() => {
         setCloudReady(isCloudBackupConfigured(loadCloudBackupConfig()));
         setPushActive(isPersonalPushCloudActive());
         setWeixinDeployed(Boolean(getWeixinCloudDeployedAt()));
+        // 如果已有配置，预填手动面板
+        const cfg = loadCloudBackupConfig();
+        if (cfg.url) setManualUrl(cfg.url);
     }, []);
 
     const configuredUrl = normalizeBackupUrl(loadCloudBackupConfig().url);
@@ -105,6 +132,7 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
         onConfigChanged?.();
     };
 
+    // ── 一键部署：打开部署范围弹窗 ───────────────────────
     const openScopeDialog = async () => {
         if (busy) return;
         setResultDialog(null);
@@ -114,8 +142,6 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
             const configuredRef = projectRefFromUrl(config.url);
             const managedRef = config.managedProjectRef === configuredRef ? configuredRef : "";
             if (managedRef) {
-                // 本应用创建过的专用项目允许原地重新部署；旧版手填/误选项目没有标记，
-                // 一律走新建流程，绝不把这次发布写回已有业务库。
                 setSelectedRef(managedRef);
                 setOrganizations([]);
                 setSelectedOrganizationSlug(config.managedOrganizationSlug || "");
@@ -155,8 +181,6 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
             const bucket = await testCloudBackupConnection(loadCloudBackupConfig());
             if (bucket.ok) return;
             lastError = bucket.error || lastError;
-            // 新项目可能先报告 ACTIVE_HEALTHY，Storage 的 tenant 配置稍后才就绪。
-            // 只重试这个明确的初始化窗口；密钥/权限等真实错误立即反馈。
             if (!/TenantNotFound|Missing tenant config for tenant/i.test(lastError)) {
                 throw new Error(`备份桶创建失败：${lastError}`);
             }
@@ -182,7 +206,6 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
                 });
                 projectRef = created.projectRef;
                 setSelectedRef(projectRef);
-                // 先记住已创建的项目，网络中断或初始化超时时可继续，不会再创建第二个。
                 saveCloudBackupConfig({
                     ...loadCloudBackupConfig(),
                     url: `https://${projectRef}.supabase.co`,
@@ -195,7 +218,6 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
             setProgress("等待项目初始化…");
             await waitForProjectReady(projectRef);
 
-            // 在建桶、微信函数和推送函数中的任何写入发生前做总闸检查。
             setProgress("确认独立项目…");
             await callSupabaseAdmin({ action: "assert_dedicated_project", token, projectRef });
             await callSupabaseAdmin({
@@ -213,7 +235,6 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
                 on conflict (id) do update set schema_version = excluded.schema_version, updated_at = excluded.updated_at;`,
             });
 
-            // 取回密钥，写入原云备份配置（保留自动备份等既有设置项）
             setProgress("取回项目密钥…");
             const keys = await callSupabaseAdmin<{ serviceRoleKey: string }>({ action: "api_keys", token, projectRef });
             saveCloudBackupConfig({
@@ -232,8 +253,6 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
 
             if (scopeWeixin) {
                 setProgress("部署微信云函数…");
-                // 部署不依赖 Bot：没有 Bot 时函数空转待命，建 Bot 后运行包自动同步。
-                // 这里只是顺手把已有 Bot 的运行包传上去，失败不阻塞部署。
                 await syncAllWeixinBotRuntimesToCloud().catch(() => []);
                 const cronSecret = await ensureWeixinCloudCronSecret();
                 await deployWeixinCloudFunction(token);
@@ -278,6 +297,149 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
         }
     };
 
+    // ── 手动连接：检测已有项目 ────────────────────────────
+    const runConnect = async () => {
+        if (busy) return;
+        const url = manualUrl.trim();
+        const key = manualKey.trim();
+        if (!url || !key) {
+            setResultDialog({ title: "请填写完整", text: "Supabase URL 和 service_role key 均不能为空。" });
+            return;
+        }
+        setCheckResult(null);
+        setBusy("connect");
+        try {
+            setProgress("连接并检测项目状态…");
+            const result = await connectExistingPushCloud(url, key);
+            setCheckResult({
+                schemaVersion: result.schemaVersion,
+                isPersonalCloud: result.healthStatus === "ready",
+                pushFunctionOk: result.healthStatus === "ready",
+                weixinFunctionOk: Boolean(getWeixinCloudDeployedAt()),
+                needsRedeploy: result.needsRedeploy,
+                redeployReason: result.redeployReason,
+            });
+            refreshStatus();
+            if (!result.needsRedeploy) {
+                setResultDialog({ title: "连接成功", text: `已成功连接到项目 ${projectRefFromUrl(url)}，云端版本 v${result.schemaVersion}，所有功能就绪。` });
+            }
+        } catch (err) {
+            setResultDialog({ title: "连接失败", text: err instanceof Error ? err.message : String(err) });
+        } finally {
+            setProgress("");
+            setBusy(null);
+        }
+    };
+
+    // ── 手动连接：重新检测版本（已连接后刷新） ────────────
+    const runRecheck = async () => {
+        if (busy) return;
+        const cfg = loadCloudBackupConfig();
+        const url = cfg.url;
+        const key = cfg.key;
+        if (!url || !key) return;
+        setBusy("check");
+        setProgress("重新检测版本…");
+        try {
+            const projectRef = projectRefFromUrl(url);
+            const data = await callSupabaseAdmin<{
+                schemaVersion: number;
+                isPersonalCloud: boolean;
+                pushFunctionOk: boolean;
+                weixinFunctionOk: boolean;
+            }>({ action: "check_project", projectRef, serviceRoleKey: key });
+            const needsRedeploy = !data.pushFunctionOk || data.schemaVersion < PERSONAL_PUSH_SCHEMA_VERSION;
+            setCheckResult({
+                ...data,
+                needsRedeploy,
+                redeployReason: needsRedeploy
+                    ? (!data.pushFunctionOk
+                        ? "离线推送云函数未响应，可能尚未部署。"
+                        : `云端版本 v${data.schemaVersion}，当前需要 v${PERSONAL_PUSH_SCHEMA_VERSION}，需重新部署升级。`)
+                    : undefined,
+            });
+        } catch (err) {
+            setResultDialog({ title: "检测失败", text: err instanceof Error ? err.message : String(err) });
+        } finally {
+            setProgress("");
+            setBusy(null);
+        }
+    };
+
+    // ── 重新部署（版本升级）弹窗确认后执行 ───────────────
+    const runRedeploy = async () => {
+        if (busy || !redeployToken.trim()) return;
+        setRedeployDialogOpen(false);
+        setBusy("deploy");
+        setProgress("升级部署中…");
+        try {
+            // 把当前 token 同步给一键部署流程使用
+            const cfg = loadCloudBackupConfig();
+            const projectRef = projectRefFromUrl(cfg.url);
+            // 写入 token 供 openScopeDialog 使用，但这里直接走完整流程
+            setSelectedRef(projectRef);
+            setScopeBackup(true);
+            setScopeWeixin(Boolean(getWeixinCloudDeployedAt()));
+            setScopePush(true);
+
+            setProgress("确认独立项目…");
+            await callSupabaseAdmin({ action: "assert_dedicated_project", token: redeployToken, projectRef });
+            await callSupabaseAdmin({
+                action: "run_sql",
+                token: redeployToken,
+                projectRef,
+                sql: `create table if not exists public.ai_phone_cloud_meta (
+                    id text primary key,
+                    schema_version integer not null default 1,
+                    created_at timestamptz not null default now(),
+                    updated_at timestamptz not null default now()
+                );
+                insert into public.ai_phone_cloud_meta (id, schema_version, updated_at)
+                values ('personal-cloud', 3, now())
+                on conflict (id) do update set schema_version = excluded.schema_version, updated_at = excluded.updated_at;`,
+            });
+
+            if (Boolean(getWeixinCloudDeployedAt())) {
+                setProgress("升级微信云函数…");
+                await syncAllWeixinBotRuntimesToCloud().catch(() => []);
+                const cronSecret = await ensureWeixinCloudCronSecret();
+                await deployWeixinCloudFunction(redeployToken);
+                await callSupabaseAdmin({
+                    action: "run_sql",
+                    token: redeployToken,
+                    projectRef,
+                    sql: buildWeixinCloudAssistantCronSql(cronSecret),
+                });
+                markWeixinCloudDeployed();
+                saveWeixinCloudScheduled(true);
+            }
+
+            setProgress("升级离线推送…");
+            const pushWasEnabled = await getOfflinePushState() === "on";
+            await deployPersonalPushCloud(redeployToken);
+            if (pushWasEnabled) {
+                const subscription = await ensurePersonalPushSubscription();
+                if (!subscription.ok) {
+                    throw new Error(`离线推送已升级，但本设备订阅迁移失败：${subscription.error || "未知错误"}。请到推送设置里重新开启。`);
+                }
+            } else {
+                markAccountPushSubscribed(false);
+            }
+            savePushCloudScheduled(true);
+
+            setRedeployToken("");
+            setCheckResult(null);
+            setResultDialog({ title: "升级完成", text: "云端已升级到最新版本，所有功能就绪。" });
+        } catch (err) {
+            setResultDialog({ title: "升级失败", text: err instanceof Error ? err.message : String(err) });
+        } finally {
+            setProgress("");
+            setBusy(null);
+            refreshStatus();
+        }
+    };
+
+    // ── UI 辅助组件 ───────────────────────────────────────
     const scopeRow = (
         label: string,
         checked: boolean,
@@ -312,9 +474,11 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
         </div>
     );
 
+    const isBusy = Boolean(busy);
+
     return (
         <div className="flex flex-col gap-4">
-            {/* 中央主按钮：直达令牌页 */}
+            {/* ── 一键部署区域 ── */}
             <div className="flex flex-col items-center justify-center gap-2 pt-1">
                 <button
                     type="button"
@@ -342,20 +506,165 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
                     aria-label="确认并选择 Supabase 组织与部署范围"
                     className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-black text-white shadow-sm transition-all hover:bg-gray-800 active:scale-95 disabled:opacity-30 focus:outline-none"
                     onClick={() => void openScopeDialog()}
-                    disabled={Boolean(busy) || !token.trim()}
+                    disabled={isBusy || !token.trim()}
                 >
                     {busy === "organizations" ? <Loader2 size={17} className="animate-spin" /> : <Check size={18} strokeWidth={2.2} />}
                 </button>
             </div>
 
-            {/* 三项状态 */}
+            {/* ── 三项状态卡片 ── */}
             <div className="flex flex-col gap-2">
-                {statusCard(<CloudUpload size={17} strokeWidth={1.9} />, "云备份", cloudReady, `已部署 · ${configuredUrl.replace(/^https?:\/\//, "").replace(/\.supabase\.co$/, "")}`)}
+                {statusCard(<CloudUpload size={17} strokeWidth={1.9} />, "云备份", cloudReady, `已连接 · ${configuredUrl.replace(/^https?:\/\//, "").replace(/\.supabase\.co$/, "")}`)}
                 {statusCard(<MessageSquare size={17} strokeWidth={1.9} />, "微信接入", weixinDeployed, "云函数与定时任务已部署")}
                 {statusCard(<Satellite size={17} strokeWidth={1.9} />, "离线推送", pushActive, "已部署到你的 Supabase")}
             </div>
 
-            {/* 结果弹窗（成功/失败统一） */}
+            {/* ── 分隔线 ── */}
+            <div className="flex items-center gap-2">
+                <div className="flex-1 border-t border-black/[0.06]" />
+                <span className="text-[11px] font-medium text-gray-400">其他设备 / 已有项目</span>
+                <div className="flex-1 border-t border-black/[0.06]" />
+            </div>
+
+            {/* ── 手动连接面板 ── */}
+            <div className="flex flex-col gap-0 rounded-[18px] border border-black/[0.07] overflow-hidden">
+                {/* 折叠标题栏 */}
+                <button
+                    type="button"
+                    className="flex items-center gap-2.5 px-4 py-3 text-left hover:bg-black/[0.02] transition-colors focus:outline-none"
+                    onClick={() => setManualPanelOpen(v => !v)}
+                >
+                    <Link size={15} strokeWidth={1.9} className="shrink-0 text-gray-500" />
+                    <div className="flex-1 min-w-0">
+                        <p className="menu-label">手动连接已有项目</p>
+                        <p className="menu-desc !mt-0">在其他端填写 URL + Key 直接接入，自动检测版本</p>
+                    </div>
+                    {manualPanelOpen
+                        ? <ChevronUp size={15} className="shrink-0 text-gray-400" />
+                        : <ChevronDown size={15} className="shrink-0 text-gray-400" />}
+                </button>
+
+                {/* 展开内容 */}
+                {manualPanelOpen && (
+                    <div className="flex flex-col gap-3 px-4 pb-4 pt-1 border-t border-black/[0.05]">
+                        <p className="menu-desc !mt-0 text-[11px]">
+                            从已部署的设备复制「Supabase URL」和「service_role key」填入，本设备即可接入同一个个人云，无需重新部署。
+                        </p>
+
+                        <label className="flex flex-col gap-1">
+                            <span className="menu-desc !mt-0 text-[11px] font-medium">Supabase URL</span>
+                            <Input
+                                type="url"
+                                value={manualUrl}
+                                onChange={(e) => { setManualUrl(e.target.value); setCheckResult(null); }}
+                                placeholder="https://xxxx.supabase.co"
+                                spellCheck={false}
+                                disabled={isBusy}
+                            />
+                        </label>
+
+                        <label className="flex flex-col gap-1">
+                            <span className="menu-desc !mt-0 text-[11px] font-medium">service_role key</span>
+                            <Input
+                                type="password"
+                                value={manualKey}
+                                onChange={(e) => { setManualKey(e.target.value); setCheckResult(null); }}
+                                placeholder="eyJhbGciOiJIUzI1NiIs…"
+                                spellCheck={false}
+                                disabled={isBusy}
+                            />
+                        </label>
+
+                        <button
+                            type="button"
+                            className="ui-btn ui-btn-primary"
+                            onClick={() => void runConnect()}
+                            disabled={isBusy || !manualUrl.trim() || !manualKey.trim()}
+                        >
+                            {busy === "connect"
+                                ? <><Loader2 size={14} className="animate-spin" /> {progress || "检测中…"}</>
+                                : "连接并检测版本"}
+                        </button>
+
+                        {/* 检测结果展示 */}
+                        {checkResult && (
+                            <div className={`flex flex-col gap-2 rounded-[14px] px-3 py-3 ${checkResult.needsRedeploy ? "bg-amber-50 border border-amber-200" : "bg-green-50 border border-green-200"}`}>
+                                <div className="flex items-center gap-2">
+                                    <span className={`h-2 w-2 rounded-full shrink-0 ${checkResult.needsRedeploy ? "bg-amber-400" : "bg-green-500"}`} />
+                                    <span className="text-[12px] font-semibold">
+                                        {checkResult.needsRedeploy ? "需要升级部署" : "版本匹配，已就绪"}
+                                    </span>
+                                    <button
+                                        type="button"
+                                        className="ml-auto flex items-center gap-1 text-[11px] text-gray-500 hover:text-gray-700"
+                                        onClick={() => void runRecheck()}
+                                        disabled={isBusy}
+                                    >
+                                        {busy === "check"
+                                            ? <Loader2 size={11} className="animate-spin" />
+                                            : <RefreshCw size={11} />}
+                                        重新检测
+                                    </button>
+                                </div>
+
+                                <div className="flex flex-col gap-1 text-[11px] text-gray-600">
+                                    <div className="flex justify-between">
+                                        <span>云端 schema 版本</span>
+                                        <span className="font-mono font-medium">v{checkResult.schemaVersion} / v{PERSONAL_PUSH_SCHEMA_VERSION}</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span>离线推送云函数</span>
+                                        <span className={checkResult.pushFunctionOk ? "text-green-600 font-medium" : "text-red-500 font-medium"}>
+                                            {checkResult.pushFunctionOk ? "✓ 正常" : "✗ 未就绪"}
+                                        </span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span>个人云标记</span>
+                                        <span className={checkResult.isPersonalCloud ? "text-green-600 font-medium" : "text-amber-600 font-medium"}>
+                                            {checkResult.isPersonalCloud ? "✓ 已确认" : "⚠ 未检测到"}
+                                        </span>
+                                    </div>
+                                </div>
+
+                                {checkResult.needsRedeploy && checkResult.redeployReason && (
+                                    <p className="text-[11px] text-amber-700 leading-relaxed">
+                                        {checkResult.redeployReason}
+                                    </p>
+                                )}
+
+                                {checkResult.needsRedeploy && (
+                                    <button
+                                        type="button"
+                                        className="ui-btn ui-btn-primary mt-1"
+                                        style={{ background: "var(--c-warning, #d97706)", borderColor: "var(--c-warning, #d97706)" } as CSSProperties}
+                                        onClick={() => setRedeployDialogOpen(true)}
+                                        disabled={isBusy}
+                                    >
+                                        升级部署到最新版本
+                                    </button>
+                                )}
+                            </div>
+                        )}
+
+                        {/* 已配置时显示快速重新检测 */}
+                        {!checkResult && cloudReady && !manualKey && (
+                            <button
+                                type="button"
+                                className="flex items-center justify-center gap-1.5 text-[12px] text-gray-500 hover:text-gray-700 py-1"
+                                onClick={() => void runRecheck()}
+                                disabled={isBusy}
+                            >
+                                {busy === "check"
+                                    ? <Loader2 size={12} className="animate-spin" />
+                                    : <RefreshCw size={12} />}
+                                检测当前已连接项目的版本
+                            </button>
+                        )}
+                    </div>
+                )}
+            </div>
+
+            {/* ── 结果弹窗 ── */}
             {resultDialog && (
                 <div className="modal-overlay" data-ui="modal" onClick={() => setResultDialog(null)}>
                     <div
@@ -378,7 +687,7 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
                 </div>
             )}
 
-            {/* 部署范围弹窗 */}
+            {/* ── 一键部署范围弹窗 ── */}
             {dialogOpen && (
                 <div className="modal-overlay" data-ui="modal" onClick={() => { if (busy !== "deploy") setDialogOpen(false); }}>
                     <div
@@ -396,7 +705,7 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
                                 </div>
                             ) : (
                                 <div className="menu-desc !mt-0 rounded-[14px] bg-black/[0.03] px-3 py-2.5">
-                                    将更新此前由 AI Phone 创建的专用项目。
+                                    将更新此前由 AI Phone 创建的专用项目（{selectedRef}）。
                                 </div>
                             )}
                             {!selectedRef && (
@@ -429,11 +738,76 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
                                 type="button"
                                 className={`ui-btn ui-btn-primary ${busy === "deploy" ? "is-busy" : ""}`}
                                 onClick={() => void runDeploy()}
-                                disabled={Boolean(busy) || (!selectedRef && !selectedOrganizationSlug) || (!scopeBackup && !scopeWeixin && !scopePush)}
+                                disabled={isBusy || (!selectedRef && !selectedOrganizationSlug) || (!scopeBackup && !scopeWeixin && !scopePush)}
                             >
                                 {busy === "deploy"
                                     ? <><Loader2 size={15} className="animate-spin" /> {progress || "部署中…"}</>
                                     : selectedRef ? "开始部署" : "创建并部署"}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* ── 升级部署确认弹窗 ── */}
+            {redeployDialogOpen && (
+                <div className="modal-overlay" data-ui="modal" onClick={() => { if (!isBusy) setRedeployDialogOpen(false); }}>
+                    <div
+                        className="modal-dialog"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-label="升级部署到最新版本"
+                        onClick={(e) => e.stopPropagation()}
+                    >
+                        <div className="modal-body flex flex-col gap-3">
+                            <h3 className="modal-title">升级部署</h3>
+                            <p className="menu-desc !mt-0">
+                                将把云函数和数据库 schema 升级到 v{PERSONAL_PUSH_SCHEMA_VERSION}。
+                                需要 Supabase Access Token 授权（只用一次，不保存）。
+                            </p>
+                            {checkResult?.redeployReason && (
+                                <div className="rounded-[12px] bg-amber-50 border border-amber-200 px-3 py-2 text-[12px] text-amber-700">
+                                    {checkResult.redeployReason}
+                                </div>
+                            )}
+                            <label className="flex flex-col gap-1">
+                                <span className="menu-desc !mt-0 text-[11px] font-medium">Access Token</span>
+                                <Input
+                                    type="password"
+                                    value={redeployToken}
+                                    onChange={(e) => setRedeployToken(e.target.value)}
+                                    placeholder="sbp_… Access Token"
+                                    spellCheck={false}
+                                    autoFocus
+                                />
+                            </label>
+                            <button
+                                type="button"
+                                className="inline-flex items-center justify-center gap-1 text-[11px] text-gray-400 hover:text-gray-600"
+                                onClick={() => window.open(SUPABASE_TOKENS_URL, "_blank", "noopener")}
+                            >
+                                <ExternalLink size={11} />
+                                打开 Supabase 令牌页生成 Token
+                            </button>
+                        </div>
+                        <div className="modal-footer">
+                            <button
+                                type="button"
+                                className="ui-btn ui-btn-outline"
+                                onClick={() => setRedeployDialogOpen(false)}
+                                disabled={isBusy}
+                            >
+                                取消
+                            </button>
+                            <button
+                                type="button"
+                                className={`ui-btn ui-btn-primary ${busy === "deploy" ? "is-busy" : ""}`}
+                                onClick={() => void runRedeploy()}
+                                disabled={isBusy || !redeployToken.trim()}
+                            >
+                                {busy === "deploy"
+                                    ? <><Loader2 size={15} className="animate-spin" /> {progress || "升级中…"}</>
+                                    : "确认升级"}
                             </button>
                         </div>
                     </div>

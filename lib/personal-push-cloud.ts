@@ -184,6 +184,78 @@ async function waitForPersonalPushHealth(
   return { ready: false, error: lastError };
 }
 
+/**
+ * connectExistingPushCloud：其他端手动填写 URL + Key 后，
+ * 直接做健康检查并写入本地状态，不需要 Access Token、不重新部署任何东西。
+ * 返回检测到的 schemaVersion，调用方据此决定是否提示用户重新部署。
+ */
+export async function connectExistingPushCloud(
+  url: string,
+  serviceKey: string,
+): Promise<PersonalPushCloudState & { needsRedeploy: boolean; redeployReason?: string }> {
+  const normalizedUrl = normalizeBackupUrl(url);
+  const projectRef = projectRefFromUrl(normalizedUrl);
+  if (!normalizedUrl || !projectRef) throw new Error("Supabase URL 格式不正确，应为 https://xxxx.supabase.co");
+  if (!serviceKey.trim()) throw new Error("请填写 service_role key。");
+
+  // 先把配置写进去（健康检查需要用），保留原有备份设置
+  const prevConfig = loadCloudBackupConfig();
+  saveCloudBackupConfig({
+    ...prevConfig,
+    url: normalizedUrl,
+    key: serviceKey.trim(),
+    managedProjectRef: projectRef,
+    managedOrganizationSlug: prevConfig.managedOrganizationSlug,
+  });
+
+  // 做健康检查
+  const health = await waitForPersonalPushHealth(normalizedUrl, serviceKey.trim());
+
+  // 读取云端 schemaVersion（通过 /api/supabase-admin check_project）
+  let remoteSchemaVersion = 0;
+  let isPersonalCloud = false;
+  try {
+    const res = await fetch("/api/supabase-admin", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "check_project", projectRef, serviceRoleKey: serviceKey.trim() }),
+    });
+    if (res.ok) {
+      const data = await res.json() as { ok?: boolean; schemaVersion?: number; isPersonalCloud?: boolean };
+      if (data.ok) {
+        remoteSchemaVersion = Number(data.schemaVersion) || 0;
+        isPersonalCloud = Boolean(data.isPersonalCloud);
+      }
+    }
+  } catch { /* 网络异常，继续 */ }
+
+  // 判断是否需要重新部署
+  let needsRedeploy = false;
+  let redeployReason: string | undefined;
+  if (!health.ready) {
+    needsRedeploy = true;
+    redeployReason = health.error || "云函数未响应，可能尚未部署。";
+  } else if (remoteSchemaVersion < PERSONAL_PUSH_SCHEMA_VERSION) {
+    needsRedeploy = true;
+    redeployReason = `云端版本 v${remoteSchemaVersion}，当前需要 v${PERSONAL_PUSH_SCHEMA_VERSION}，请重新部署以升级。`;
+  } else if (!isPersonalCloud) {
+    needsRedeploy = true;
+    redeployReason = "未检测到个人云标记（ai_phone_cloud_meta），建议重新部署完成初始化。";
+  }
+
+  const state: PersonalPushCloudState = {
+    enabled: true,
+    projectRef,
+    url: normalizedUrl,
+    deployedAt: new Date().toISOString(),
+    healthStatus: health.ready ? "ready" : "pending",
+    schemaVersion: Math.max(remoteSchemaVersion, health.ready ? PERSONAL_PUSH_SCHEMA_VERSION : 1),
+    healthError: health.ready ? undefined : health.error,
+  };
+  savePersonalPushState(state);
+  return { ...state, needsRedeploy, redeployReason };
+}
+
 export async function deployPersonalPushCloud(accessToken: string): Promise<PersonalPushCloudState> {
   const backup = loadCloudBackupConfig();
   if (!isCloudBackupConfigured(backup)) {
