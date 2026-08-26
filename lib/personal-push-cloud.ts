@@ -2,6 +2,7 @@ import {
   isCloudBackupConfigured,
   loadCloudBackupConfig,
   normalizeBackupUrl,
+  saveCloudBackupConfig,
 } from "./cloud-backup/config";
 import { kvGet, kvRemove, kvSet, registerKvMigration } from "./kv-db";
 

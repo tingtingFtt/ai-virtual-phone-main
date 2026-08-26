@@ -140,12 +140,48 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
         try {
             const config = loadCloudBackupConfig();
             const configuredRef = projectRefFromUrl(config.url);
+
+            // 优先级1：本机之前一键部署过的专用项目（有 managedProjectRef 标记）
             const managedRef = config.managedProjectRef === configuredRef ? configuredRef : "";
-            if (managedRef) {
-                setSelectedRef(managedRef);
+
+            // 优先级2：本机手动连接过的项目（有 URL+Key 但没有 managedProjectRef）
+            // 通过 Access Token 查出该 projectRef 的 api-keys 确认项目存在，然后复用
+            const manualConnectedRef = !managedRef && configuredRef && config.key ? configuredRef : "";
+
+            if (managedRef || manualConnectedRef) {
+                const existingRef = managedRef || manualConnectedRef;
+                setProgress("确认已有项目…");
+
+                // 用 Access Token 查一次项目状态，确认项目健康且 token 有效
+                // 同时顺手把 managedProjectRef 补上，让后续重新部署流程更顺畅
+                try {
+                    const statusData = await callSupabaseAdmin<{ status: string }>({
+                        action: "project_status", token, projectRef: existingRef,
+                    });
+                    if (!["ACTIVE_HEALTHY", "ACTIVE_UNHEALTHY"].includes(statusData.status)) {
+                        throw new Error(`项目状态异常（${statusData.status}），请到 Supabase Dashboard 查看。`);
+                    }
+                    // 如果是手动连接的项目，顺手补上 managedProjectRef 标记
+                    if (manualConnectedRef && !managedRef) {
+                        saveCloudBackupConfig({
+                            ...loadCloudBackupConfig(),
+                            managedProjectRef: existingRef,
+                        });
+                    }
+                } catch (err) {
+                    // token 无效或项目不存在时，回退到新建流程
+                    if (String(err).includes("管理接口") || String(err).includes("HTTP 4")) {
+                        throw err;
+                    }
+                    // 其他错误（如项目状态异常）直接抛出
+                    throw err;
+                }
+
+                setSelectedRef(existingRef);
                 setOrganizations([]);
                 setSelectedOrganizationSlug(config.managedOrganizationSlug || "");
             } else {
+                // 没有任何已有项目记录，走新建流程
                 const data = await callSupabaseAdmin<{ organizations: OrganizationOption[] }>({ action: "organizations", token });
                 if (data.organizations.length === 0) throw new Error("该 Supabase 账号下没有可用组织。");
                 setOrganizations(data.organizations);
@@ -159,6 +195,7 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
         } catch (err) {
             setResultDialog({ title: "部署失败", text: err instanceof Error ? err.message : String(err) });
         } finally {
+            setProgress("");
             setBusy(null);
         }
     };
@@ -705,7 +742,7 @@ export function CloudServicesSetup({ onConfigChanged }: { onConfigChanged?: () =
                                 </div>
                             ) : (
                                 <div className="menu-desc !mt-0 rounded-[14px] bg-black/[0.03] px-3 py-2.5">
-                                    将更新此前由 AI Phone 创建的专用项目（{selectedRef}）。
+                                    检测到已连接项目 <span className="font-mono font-medium">{selectedRef}</span>，将直接更新该项目的云函数与数据库，无需新建。
                                 </div>
                             )}
                             {!selectedRef && (
